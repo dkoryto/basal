@@ -301,7 +301,7 @@ class Gemma4Forward:
             from torch.nn.attention import SDPBackend, sdpa_kernel
             name = SDPA_KERNELS[kind]
             B, H, Sq, d = q.shape
-            G, Lk = k.shape[1], k.shape[2]
+            Lk = k.shape[2]
             if split or B * Sq * Lk > self.ATTN_PAIRS or B * Lk * H * d * k.element_size() * 2 > self.KV_BYTES:
                 with sdpa_kernel([getattr(SDPBackend, name)]) if name else nullcontext():
                     return self._split(a, q, k, v, mask)
@@ -464,7 +464,7 @@ class Gemma4Forward:
             # a state over 16k tokens: every global-layer call in parts, from its first part on (its buffers leave
             # no room for the scores of a part over 14k keys in one call: 3.5 GB on ultra at 76k)
             split = len(seq) > self.ATTN_PAIRS // self.CHUNK
-            kv, bufs = {}, {}
+            kv, kpos, bufs = {}, {}, {}
             at = torch.arange(len(seq), device=self.lm.embed_tokens.weight.device)[None]
             for s0, s1 in self._parts(seq, len(seq)):
                 h, pli, pos, valid, blk, _ = self._rows([seq[s0:s1]], [s0], media, seqs)
