@@ -50,6 +50,7 @@ basal-export-gguf = "basal.gguf_export:main"
 basal-mcp = "basal.mcp_server:main"
 basal-calibrate = "basal.calibrate:main"
 basal-viz = "basal.viz:main"
+basal-interpolate = "basal.interpolate:main"
 
 [tool.setuptools]
 packages = ["basal"]
