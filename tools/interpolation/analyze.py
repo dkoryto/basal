@@ -17,8 +17,9 @@ temperature_per_prim[prim], else 1, from calib/<name>.json; without that file th
 rows' FIT split (calibrate.fit_temperature on the same grid, buckets for fmt 2 with >= 50 decisions). "ECE cal CERT"
 is measured on the CERT split (30% by sha256 of the group) only, the decisions those temperatures were not fitted on.
 
-Bootstrap: paired over the items both candidates answered, items resampled with replacement, the difference of the
-macro accuracy (mean of the per-task accuracies) candidate - reference, percentile 95% CI.
+Bootstrap: paired over the items both candidates answered, items resampled with replacement within each task (the
+panels sample items per task), the difference of the macro accuracy (mean of the per-task accuracies) candidate -
+reference, percentile 95% CI.
 """
 import argparse
 import hashlib
@@ -141,23 +142,22 @@ def macro(correct, fam, n_fam):
 
 
 def boot_diff(ids, cand, ref, fam_index, n_fam, reps, seed):
-    """Paired bootstrap of macro(cand) - macro(ref) over the items both answered -> (diff, lo, hi, n)."""
+    """Paired bootstrap of macro(cand) - macro(ref) over the items both answered -> (diff, lo, hi, n). Items are
+    resampled within each task, as the panels sample them per task: every replicate keeps each task's item count, so
+    the task mix (and with it the macro weights) stays that of the panel."""
     common = [i for i in ids if i in cand and i in ref]
     a = np.array([cand[i] for i in common], float)
     b = np.array([ref[i] for i in common], float)
     fam = np.array([fam_index[i] for i in common])
     diff = macro(a, fam, n_fam) - macro(b, fam, n_fam)
     rng = np.random.default_rng(seed)
-    idx = rng.integers(0, len(common), (reps, len(common)))
-    F, d = fam[idx], (a - b)[idx]
-    total, k = np.zeros(reps), np.zeros(reps)
+    d = a - b
+    per_task = []
     for f in range(n_fam):
-        m = F == f
-        cnt = m.sum(1)
-        # per-task accuracy difference; a task absent from a resample is left out of that rep's mean
-        total += np.where(cnt > 0, (d * m).sum(1) / np.maximum(cnt, 1), 0.0)
-        k += cnt > 0
-    out = total / k
+        df = d[fam == f]
+        if len(df):
+            per_task.append(df[rng.integers(0, len(df), (reps, len(df)))].mean(1))
+    out = np.mean(per_task, axis=0)
     lo, hi = np.percentile(out, [2.5, 97.5])
     return diff, float(lo), float(hi), len(common)
 

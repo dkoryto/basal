@@ -1,21 +1,38 @@
 """basal-interpolate: alpha 0 / 1 reproduce the checkpoints, 0.5 is the fp32 mean stored in bf16, integer tensors come
-from the new checkpoint, shards are kept, mismatched checkpoints are refused (but not a config or tokenizer written
-by another transformers / tokenizers release), and the non-weight files come from --meta-from (on tiny checkpoints)."""
+from the new checkpoint, shards (also nested ones) are kept, mismatched or quantized checkpoints are refused before
+anything is written, a tokenizer serialized differently is accepted while one that splits text differently needs
+--allow-tokenizer-difference, and the non-weight files come from --meta-from (on tiny checkpoints)."""
 import json
 from pathlib import Path
 
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
+from tokenizers import Tokenizer, models, normalizers, pre_tokenizers
 
 from basal.interpolate import interpolate, main
 
-TOKENIZER = {"model": {"type": "BPE", "vocab": {"<s>": 0, "a": 1, "b": 2, "ab": 3}, "merges": [["a", "b"]]},
-             "added_tokens": [{"id": 0, "content": "<s>"}], "normalizer": None,
-             "pre_tokenizer": {"type": "Metaspace", "replacement": "▁"}}
+VOCAB = {"<unk>": 0, "<s>": 1, "▁": 2, "a": 3, "b": 4, "ab": 5, "▁a": 6, "▁ab": 7}
+MERGES = [("a", "b"), ("▁", "a"), ("▁a", "b")]
 
 
-def make_ckpt(d, seed, sharded=False, extra=None, shape=(4, 8), config=None, tokenizer=TOKENIZER, prompt=2):
+def tokenizer_json(legacy=False, vocab=VOCAB):
+    """A tiny BPE tokenizer: the transformers 5 layout (Metaspace pre-tokenizer), or with legacy=True the older one
+    (Prepend / Replace normalizer, as in Bielik-*-v3.0-Instruct), which also marks a word boundary at a leading space."""
+    t = Tokenizer(models.BPE(vocab=vocab, merges=MERGES, unk_token="<unk>"))
+    if legacy:
+        t.normalizer = normalizers.Sequence([normalizers.Prepend("▁"), normalizers.Replace(" ", "▁")])
+    else:
+        t.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="first", split=False)
+    t.add_special_tokens(["<s>"])
+    return json.loads(t.to_str())
+
+
+TOKENIZER = tokenizer_json()
+
+
+def make_ckpt(d, seed, sharded=False, extra=None, shape=(4, 8), config=None, tokenizer=TOKENIZER, prompt=2,
+              subdir=""):
     d = Path(d)
     d.mkdir(parents=True)
     g = torch.Generator().manual_seed(seed)
@@ -24,12 +41,13 @@ def make_ckpt(d, seed, sharded=False, extra=None, shape=(4, 8), config=None, tok
          "pos.ids": torch.arange(5, dtype=torch.int64) + seed}
     t.update(extra or {})
     if sharded:
+        (d / subdir).mkdir(exist_ok=True)
         s1 = {"a.weight": t["a.weight"]}
         s2 = {k: v for k, v in t.items() if k != "a.weight"}
-        save_file(s1, d / "model-00001-of-00002.safetensors")
-        save_file(s2, d / "model-00002-of-00002.safetensors")
-        wm = {k: "model-00001-of-00002.safetensors" for k in s1}
-        wm.update({k: "model-00002-of-00002.safetensors" for k in s2})
+        f1, f2 = f"{subdir}model-00001-of-00002.safetensors", f"{subdir}model-00002-of-00002.safetensors"
+        save_file(s1, d / f1)
+        save_file(s2, d / f2)
+        wm = {**dict.fromkeys(s1, f1), **dict.fromkeys(s2, f2)}
         (d / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
     else:
         save_file(t, d / "model.safetensors")
@@ -39,7 +57,7 @@ def make_ckpt(d, seed, sharded=False, extra=None, shape=(4, 8), config=None, tok
     (d / "config.json").write_text(json.dumps(config))
     (d / "tokenizer.json").write_text(json.dumps(tokenizer))
     (d / "basal.json").write_text(json.dumps({"name": f"m{seed}", "layout": "qfirst", "prompt": prompt}))
-    for f in ("README.md", "SHA256SUMS", "evidence_head.pt"):
+    for f in ("README.md", "SHA256SUMS", "evidence_head.pt", "pytorch_model.bin", "pytorch_model.bin.index.json"):
         (d / f).write_text("x")
     (d / "think").mkdir()
     (d / "think" / "x.json").write_text("{}")
@@ -48,7 +66,7 @@ def make_ckpt(d, seed, sharded=False, extra=None, shape=(4, 8), config=None, tok
 
 def load_dir(d):
     out = {}
-    for f in Path(d).glob("*.safetensors"):
+    for f in Path(d).rglob("*.safetensors"):
         out.update(load_file(f))
     return out
 
@@ -82,48 +100,98 @@ def test_alpha_half(pair, tmp_path):
     assert torch.equal(r["pos.ids"], tn["pos.ids"])  # not floating point: from the new checkpoint
 
 
-def test_sharded(tmp_path):
-    old, to = make_ckpt(tmp_path / "old", 1, sharded=True)
-    new, tn = make_ckpt(tmp_path / "new", 2, sharded=True)
+@pytest.mark.parametrize("subdir", ["", "weights/"])
+def test_sharded(tmp_path, subdir):
+    old, to = make_ckpt(tmp_path / "old", 1, sharded=True, subdir=subdir)
+    new, tn = make_ckpt(tmp_path / "new", 2, sharded=True, subdir=subdir)
     out = interpolate(old, new, 0.5, tmp_path / "o")
-    assert (out / "model.safetensors.index.json").exists()
-    assert sorted(p.name for p in out.glob("*.safetensors")) == [
-        "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    index = json.loads((out / "model.safetensors.index.json").read_text())
+    assert all((out / f).is_file() for f in index["weight_map"].values())  # the index finds every shard
+    assert sorted(str(p.relative_to(out)) for p in out.rglob("*.safetensors")) == [
+        f"{subdir}model-00001-of-00002.safetensors", f"{subdir}model-00002-of-00002.safetensors"]
     r = load_dir(out)
     assert torch.equal(r["a.weight"], ((to["a.weight"].float() + tn["a.weight"].float()) / 2).to(torch.bfloat16))
     assert set(r) == set(tn)
 
 
-@pytest.mark.parametrize("kw", [{"config": {"architectures": ["Gemma4"], "hidden_size": 8}},
-                                {"extra": {"c.weight": torch.zeros(2)}},
-                                {"shape": (4, 9)},
-                                {"tokenizer": {**TOKENIZER, "model": {**TOKENIZER["model"], "merges": []}}}])
-def test_mismatch_refused(tmp_path, kw):
-    old, _ = make_ckpt(tmp_path / "old", 1)
-    new, _ = make_ckpt(tmp_path / "new", 2, **kw)
+FP8 = {"c.weight": torch.zeros(2, dtype=torch.float8_e4m3fn)}
+
+
+@pytest.mark.parametrize("old_kw, new_kw", [
+    ({}, {"config": {"architectures": ["Gemma4"], "hidden_size": 8}}),
+    ({}, {"extra": {"c.weight": torch.zeros(2)}}),
+    ({}, {"shape": (4, 9)}),
+    ({}, {"tokenizer": tokenizer_json(vocab={**VOCAB, "ba": 8})}),
+    ({}, {"config": {"architectures": ["LlamaForCausalLM"], "hidden_size": 8,
+                     "quantization_config": {"quant_method": "modelopt"}}}),
+    ({"extra": FP8}, {"extra": FP8}),
+])
+def test_mismatch_refused_before_writing(tmp_path, old_kw, new_kw):
+    old, _ = make_ckpt(tmp_path / "old", 1, **old_kw)
+    new, _ = make_ckpt(tmp_path / "new", 2, **new_kw)
     with pytest.raises(SystemExit):
+        interpolate(old, new, 0.5, tmp_path / "o")
+    assert not (tmp_path / "o").exists() and not (tmp_path / ".o.partial").exists()
+
+
+def test_missing_tokenizer_refused(tmp_path):
+    old, _ = make_ckpt(tmp_path / "old", 1)
+    new, _ = make_ckpt(tmp_path / "new", 2)
+    (old / "tokenizer.json").unlink()
+    with pytest.raises(SystemExit, match="tokenizer.json missing"):
         interpolate(old, new, 0.5, tmp_path / "o")
 
 
+def test_nonempty_out_refused(pair, tmp_path):
+    old, new, _, _ = pair
+    interpolate(old, new, 0.5, tmp_path / "o")
+    with pytest.raises(SystemExit, match="not empty"):
+        interpolate(old, new, 0.25, tmp_path / "o")
+    with pytest.raises(SystemExit, match="not empty"):  # never into a source checkpoint
+        interpolate(old, new, 0.25, new)
+
+
+def test_failed_write_leaves_nothing(pair, tmp_path, monkeypatch):
+    import safetensors.torch
+
+    old, new, _, _ = pair
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(safetensors.torch, "save_file", boom)
+    with pytest.raises(OSError):
+        interpolate(old, new, 0.5, tmp_path / "o")
+    assert not (tmp_path / "o").exists() and not (tmp_path / ".o.partial").exists()
+
+
 def test_other_serialization_accepted(tmp_path):
-    """The Bielik-*-v3.0-Instruct base models were written by transformers 4.x and an older tokenizers: rope_theta at
-    the top level, torch_dtype, merges as strings, a Prepend / Replace normalizer instead of the Metaspace
-    pre-tokenizer. Same architecture and token ids, so the pair is accepted."""
+    """Written by transformers 4.x: rope_theta at the top level, torch_dtype, merges as strings. Same architecture,
+    vocabulary and splitting, so the pair is accepted."""
     config = {"architectures": ["LlamaForCausalLM"], "hidden_size": 8, "rope_theta": 1000000, "rope_scaling": None,
               "torch_dtype": "bfloat16", "transformers_version": "4.44.2", "use_cache": True}
-    tokenizer = {"model": {"type": "BPE", "vocab": TOKENIZER["model"]["vocab"], "merges": ["a b"]},
-                 "added_tokens": TOKENIZER["added_tokens"], "pre_tokenizer": None,
-                 "normalizer": {"type": "Sequence", "normalizers": [{"type": "Prepend", "prepend": "▁"}]}}
+    tokenizer = json.loads(json.dumps(TOKENIZER))
+    tokenizer["model"]["merges"] = [" ".join(m) for m in tokenizer["model"]["merges"]]
     old, _ = make_ckpt(tmp_path / "old", 1, config=config, tokenizer=tokenizer)
     new, _ = make_ckpt(tmp_path / "new", 2)
     out = interpolate(old, new, 0.5, tmp_path / "o")
     assert json.loads((out / "tokenizer.json").read_text()) == TOKENIZER  # from the new checkpoint
 
 
+def test_tokenizer_splitting_difference(tmp_path):
+    """Same vocabulary, older layout that splits a leading space differently: refused unless allowed."""
+    old, _ = make_ckpt(tmp_path / "old", 1, tokenizer=tokenizer_json(legacy=True))
+    new, _ = make_ckpt(tmp_path / "new", 2)
+    with pytest.raises(SystemExit, match="split text differently"):
+        interpolate(old, new, 0.5, tmp_path / "o")
+    out = interpolate(old, new, 0.5, tmp_path / "o", allow_tokenizer_difference=True)
+    assert json.loads((out / "tokenizer.json").read_text()) == TOKENIZER
+
+
 def test_meta_files_and_basal_json(pair, tmp_path):
     old, new, _, _ = pair
     out = interpolate(old, new, 0.25, tmp_path / "o")
-    for f in ("README.md", "SHA256SUMS", "evidence_head.pt", "think/x.json"):
+    for f in ("README.md", "SHA256SUMS", "evidence_head.pt", "think/x.json", "pytorch_model.bin",
+              "pytorch_model.bin.index.json"):
         assert not (out / f).exists(), f
     assert (out / "config.json").exists() and (out / "tokenizer.json").exists()
     info = json.loads((out / "basal.json").read_text())
@@ -140,7 +208,9 @@ def test_cli_meta_from_old(pair, tmp_path):
     assert (tmp_path / "m-a1" / "model.safetensors").exists()
 
 
-def test_cli_alpha_range(pair, tmp_path):
+@pytest.mark.parametrize("alphas", [["1.5"], ["0.1", "0.1000001"]])
+def test_cli_alpha_refused(pair, tmp_path, alphas):
     old, new, _, _ = pair
     with pytest.raises(SystemExit):
-        main([str(old), str(new), "--alpha", "1.5", "--out", str(tmp_path / "m")])
+        main([str(old), str(new), "--alpha", *alphas, "--out", str(tmp_path / "m")])
+    assert not list(tmp_path.glob("m-a*"))
