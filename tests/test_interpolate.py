@@ -134,6 +134,18 @@ def test_mismatch_refused_before_writing(tmp_path, old_kw, new_kw):
     assert not (tmp_path / "o").exists() and not (tmp_path / ".o.partial").exists()
 
 
+@pytest.mark.parametrize("shard", ["../evil.safetensors", "/tmp/evil.safetensors"])
+def test_index_path_outside_model_refused(tmp_path, shard):
+    old, _ = make_ckpt(tmp_path / "old", 1, sharded=True)
+    new, _ = make_ckpt(tmp_path / "new", 2, sharded=True)
+    index = json.loads((new / "model.safetensors.index.json").read_text())
+    index["weight_map"]["a.weight"] = shard
+    (new / "model.safetensors.index.json").write_text(json.dumps(index))
+    with pytest.raises(SystemExit, match="outside the model folder"):
+        interpolate(old, new, 0.5, tmp_path / "o")
+    assert not (tmp_path / "evil.safetensors").exists() and not (tmp_path / "o").exists()
+
+
 def test_missing_tokenizer_refused(tmp_path):
     old, _ = make_ckpt(tmp_path / "old", 1)
     new, _ = make_ckpt(tmp_path / "new", 2)

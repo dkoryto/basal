@@ -51,7 +51,14 @@ def shards(model_dir):
     d = Path(model_dir)
     index = d / "model.safetensors.index.json"
     if index.exists():
-        return {k: d / v for k, v in json.loads(index.read_text())["weight_map"].items()}
+        out = {}
+        for k, v in json.loads(index.read_text())["weight_map"].items():
+            p = Path(v)
+            # the shard paths are reused under the output folder: nothing absolute, nothing that leaves the model
+            if p.is_absolute() or ".." in p.parts or not (d / p).resolve().is_relative_to(d.resolve()):
+                raise SystemExit(f"{index}: shard path {v!r} is outside the model folder")
+            out[k] = d / p
+        return out
     out = {}
     for f in sorted(d.glob("*.safetensors")):
         with safe_open(f, "pt") as s:
