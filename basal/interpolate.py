@@ -4,17 +4,20 @@
 
 alpha is the weight of the new checkpoint: 0 gives the old weights, 1 the new ones. Each tensor is mixed in fp32 and
 stored in the dtype of the new checkpoint; tensors that are not floating point (position ids) are taken from the new
-checkpoint. The output keeps the new checkpoint's shard layout and holds one output shard in memory at a time (peak:
-the largest shard of the new checkpoint plus one tensor in fp32). The result is written to a temporary folder next to
---out and renamed only once every shard is written, so a failed merge leaves no partial checkpoint.
+checkpoint. The output keeps the new checkpoint's shard layout and is streamed to disk tensor by tensor, byte for byte
+as safetensors.torch.save_file would write it, so memory holds one tensor at a time (peak: the largest tensor in fp32,
+three times), whatever the shard size. The result is written to a temporary folder next to --out and renamed only once
+every shard is written, so a failed merge leaves no partial checkpoint.
 
 The checkpoints must have the same tensor names, shapes and dtypes, unquantized weights (no quantization_config: FP8 /
 NVFP4 exports store encoded weights and scales, which do not interpolate), the same architecture (config.json,
 compared without serialization-only keys) and the same vocabulary (tokenizer.json: vocab, BPE merges, added tokens).
-The tokenizers must also split text the same way (checked on probe texts); a pair whose vocabulary matches but whose
-splitting rules differ, such as the Bielik-*-v3.0-Instruct base models (an older tokenizers layout that adds a word
+The tokenizers must also have the same settings that decide how text is split (normalizer, pre-tokenizer,
+post-processor, decoder, model options; merges compared in either serialization). A pair whose vocabulary matches but
+whose settings differ, such as the Bielik-*-v3.0-Instruct base models (an older tokenizers layout that adds a word
 boundary after special tokens) against basal-2.0, is refused unless --allow-tokenizer-difference is given: the merged
-model is served with the --meta-from tokenizer only.
+model is served with the --meta-from tokenizer only. The refusal shows a probe text the two split differently, when
+one does.
 
 The non-weight files (basal.json, tokenizer, chat template, config, CALIBRATION*.json) come from --meta-from (default:
 the new checkpoint), so the merged model is served in that checkpoint's prompt format: merging basal-1.5 and basal-2.0
@@ -25,6 +28,7 @@ calibration is only a starting point: fit one per merged model with basal-calibr
     basal-interpolate Remek/basal-1.5-mini Remek/basal-2.0-mini --alpha 0.25 0.5 0.75 --out merged/mini --meta-from old
 """
 import argparse
+import functools
 import json
 import shutil
 from pathlib import Path
@@ -37,6 +41,19 @@ WEIGHT_SUFFIXES = {".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf", ".h5
 WEIGHT_PREFIXES = ("model.safetensors.index", "pytorch_model", "tf_model", "flax_model", "model.onnx")
 # config.json keys that do not describe the architecture (serialization, runtime defaults)
 CONFIG_IGNORE = {"transformers_version", "torch_dtype", "dtype", "use_cache"}
+@functools.cache
+def torch_dtypes():
+    """safetensors dtype name -> torch dtype (torch is imported lazily, as everywhere in this module)."""
+    import torch
+
+    names = {"F64": "float64", "F32": "float32", "F16": "float16", "BF16": "bfloat16", "I64": "int64", "I32": "int32",
+             "I16": "int16", "I8": "int8", "U8": "uint8", "U16": "uint16", "U32": "uint32", "U64": "uint64",
+             "BOOL": "bool", "F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2"}
+    return {k: getattr(torch, v) for k, v in names.items() if hasattr(torch, v)}
+
+
+# tokenizer.json sections that do not change the token ids of a text
+TOKENIZER_IGNORE = {"version", "truncation", "padding"}
 # safetensors dtypes of encoded (quantized) weights
 QUANTIZED_DTYPES = {"F8_E4M3", "F8_E5M2", "F8_E8M0", "F4", "U8", "I8", "U4", "I4"}
 PROBES = ["Zażółć gęślą jaźń. Ala ma kota, 123 zł!", " leading space\n\nnew lines\ttab", "x  y   ", "",
@@ -87,6 +104,16 @@ def tokenizer_key(path):
     return m.get("type"), m.get("vocab"), merges, t.get("added_tokens", [])
 
 
+def tokenizer_settings(path):
+    """tokenizer.json without the sections that do not change token ids, merges in pair form."""
+    t = json.loads(Path(path).read_text())
+    t = {k: v for k, v in t.items() if k not in TOKENIZER_IGNORE}
+    m = t.get("model", {})
+    if m.get("merges"):
+        t["model"] = {**m, "merges": [tuple(x.split(" ", 1)) if isinstance(x, str) else tuple(x) for x in m["merges"]]}
+    return t
+
+
 def tokenization_difference(po, pn):
     """The first probe text the two tokenizers split differently, as a message, or None."""
     from tokenizers import Tokenizer
@@ -101,7 +128,8 @@ def tokenization_difference(po, pn):
 
 
 def check_pair(old, new, allow_tokenizer_difference=False):
-    """Refuses (SystemExit) a pair that cannot be interpolated; returns the tensor -> shard maps."""
+    """Refuses (SystemExit) a pair that cannot be interpolated; returns the tensor -> shard maps of both and
+    tensor -> (safetensors dtype, shape) of the new checkpoint, read from the headers."""
     from safetensors import safe_open
 
     for name in ("config.json", "tokenizer.json"):
@@ -120,11 +148,14 @@ def check_pair(old, new, allow_tokenizer_difference=False):
     if po.read_bytes() != pn.read_bytes():
         if tokenizer_key(po) != tokenizer_key(pn):
             raise SystemExit("tokenizer.json differs: the checkpoints do not share a vocabulary")
-        diff = tokenization_difference(po, pn)
-        if diff and not allow_tokenizer_difference:
-            raise SystemExit(f"the tokenizers share the vocabulary but split text differently ({diff}); the merged "
-                             "model is served with the --meta-from tokenizer only. Pass --allow-tokenizer-difference "
-                             "if that is intended (a base model written by an older tokenizers release)")
+        so, sn = tokenizer_settings(po), tokenizer_settings(pn)
+        if so != sn and not allow_tokenizer_difference:
+            keys = sorted(k for k in so.keys() | sn.keys() if so.get(k) != sn.get(k))
+            example = tokenization_difference(po, pn)
+            raise SystemExit(f"the tokenizers share the vocabulary but their settings differ ({', '.join(keys)}"
+                             + (f"; for example {example}" if example else "") + "); the merged model is served with "
+                             "the --meta-from tokenizer only. Pass --allow-tokenizer-difference if that is intended "
+                             "(a base model written by an older tokenizers release)")
 
     a, b = shards(old), shards(new)
     if not b:
@@ -132,22 +163,54 @@ def check_pair(old, new, allow_tokenizer_difference=False):
     if a.keys() != b.keys():
         raise SystemExit(f"different tensors: only old {sorted(a.keys() - b.keys())[:5]}, "
                          f"only new {sorted(b.keys() - a.keys())[:5]}")
+    specs = {}
     for k in b:  # shapes and dtypes from the headers, before anything is written
-        with safe_open(a[k], "pt") as so, safe_open(b[k], "pt") as sn:
-            so_, sn_ = so.get_slice(k), sn.get_slice(k)
-            if so_.get_shape() != sn_.get_shape():
-                raise SystemExit(f"{k}: shape {tuple(so_.get_shape())} vs {tuple(sn_.get_shape())}")
-            dt = {so_.get_dtype(), sn_.get_dtype()}
+        with safe_open(a[k], "pt") as fo, safe_open(b[k], "pt") as fn:
+            so, sn = fo.get_slice(k), fn.get_slice(k)
+            if so.get_shape() != sn.get_shape():
+                raise SystemExit(f"{k}: shape {tuple(so.get_shape())} vs {tuple(sn.get_shape())}")
+            dt = {so.get_dtype(), sn.get_dtype()}
             if dt & QUANTIZED_DTYPES and k.endswith("weight"):
                 raise SystemExit(f"{k}: quantized weights ({'/'.join(sorted(dt))}) do not interpolate")
-    return a, b
+            if sn.get_dtype() not in torch_dtypes():
+                raise SystemExit(f"{k}: unsupported dtype {sn.get_dtype()}")
+            specs[k] = (sn.get_dtype(), tuple(sn.get_shape()))
+    return a, b, specs
+
+
+def save_streamed(path, specs, produce, metadata):
+    """Writes a safetensors file tensor by tensor: specs is name -> (safetensors dtype, shape), produce(name) returns
+    the tensor. The layout is that of safetensors.torch.save_file (tensors ordered by dtype, then name; header padded to
+    8 bytes): the order is read from a file of 1-element tensors, so only one tensor is in memory at a time."""
+    import struct
+
+    import torch
+    from safetensors.torch import save
+
+    DTYPES = torch_dtypes()
+    proxy = save({k: torch.zeros(1, dtype=DTYPES[d]) for k, (d, _) in specs.items()})
+    order = [k for k in json.loads(proxy[8:8 + struct.unpack("<Q", proxy[:8])[0]]) if k != "__metadata__"]
+    header, offset = {"__metadata__": metadata}, 0
+    for k in order:
+        d, shape = specs[k]
+        size = torch.Size(shape).numel() * torch.empty(0, dtype=DTYPES[d]).element_size()
+        header[k] = {"dtype": d, "shape": list(shape), "data_offsets": [offset, offset + size]}
+        offset += size
+    h = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()
+    h += b" " * (-len(h) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(h)) + h)
+        for k in order:
+            t = produce(k)
+            if t.dtype != DTYPES[specs[k][0]] or tuple(t.shape) != specs[k][1]:
+                raise SystemExit(f"{k}: produced {t.dtype} {tuple(t.shape)}, header says {specs[k]}")
+            f.write(t.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
 
 
 def interpolate(old, new, alpha, out, meta_from=None, allow_tokenizer_difference=False):
     """Writes the merged checkpoint to out (a new or empty directory) and returns its path."""
     import torch
     from safetensors import safe_open
-    from safetensors.torch import save_file
 
     if not 0.0 <= alpha <= 1.0:
         raise SystemExit(f"alpha {alpha} outside [0, 1]")
@@ -155,7 +218,7 @@ def interpolate(old, new, alpha, out, meta_from=None, allow_tokenizer_difference
     meta_from = Path(meta_from or new)
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise SystemExit(f"{out} exists and is not empty; remove it or choose another --out")
-    a, b = check_pair(old, new, allow_tokenizer_difference)
+    a, b, specs = check_pair(old, new, allow_tokenizer_difference)
     tmp = out.parent / f".{out.name}.partial"
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
@@ -163,19 +226,17 @@ def interpolate(old, new, alpha, out, meta_from=None, allow_tokenizer_difference
         by_file = {}  # tensors grouped by the new checkpoint's shard (path relative to the model, as in the index)
         for k, f in b.items():
             by_file.setdefault(f.relative_to(new), []).append(k)
+
+        def mixed(k):
+            with safe_open(a[k], "pt") as fo, safe_open(b[k], "pt") as fn:  # no handle outlives its tensor
+                t_old, t_new = fo.get_tensor(k), fn.get_tensor(k)
+            if not t_new.is_floating_point():
+                return t_new
+            return torch.lerp(t_old.float(), t_new.float(), alpha).to(t_new.dtype)
+
         for rel, keys in by_file.items():
-            tensors = {}
-            for k in keys:
-                with safe_open(a[k], "pt") as so, safe_open(b[k], "pt") as sn:  # no handle outlives its tensor
-                    t_old, t_new = so.get_tensor(k), sn.get_tensor(k)
-                if t_new.is_floating_point():
-                    tensors[k] = torch.lerp(t_old.float(), t_new.float(), alpha).to(t_new.dtype).contiguous()
-                else:
-                    tensors[k] = t_new.clone()
-                del t_old, t_new
             (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
-            save_file(tensors, tmp / rel, metadata={"format": "pt"})
-            del tensors
+            save_streamed(tmp / rel, {k: specs[k] for k in keys}, mixed, {"format": "pt"})
         if (new / "model.safetensors.index.json").exists():
             shutil.copy(new / "model.safetensors.index.json", tmp)
 

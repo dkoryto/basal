@@ -164,13 +164,14 @@ def test_nonempty_out_refused(pair, tmp_path):
 
 
 def test_failed_write_leaves_nothing(pair, tmp_path, monkeypatch):
-    import safetensors.torch
+    import basal.interpolate
 
     old, new, _, _ = pair
 
-    def boom(*a, **k):
+    def boom(path, *a, **k):
+        Path(path).write_bytes(b"partial")
         raise OSError("disk full")
-    monkeypatch.setattr(safetensors.torch, "save_file", boom)
+    monkeypatch.setattr(basal.interpolate, "save_streamed", boom)
     with pytest.raises(OSError):
         interpolate(old, new, 0.5, tmp_path / "o")
     assert not (tmp_path / "o").exists() and not (tmp_path / ".o.partial").exists()
@@ -193,10 +194,36 @@ def test_tokenizer_splitting_difference(tmp_path):
     """Same vocabulary, older layout that splits a leading space differently: refused unless allowed."""
     old, _ = make_ckpt(tmp_path / "old", 1, tokenizer=tokenizer_json(legacy=True))
     new, _ = make_ckpt(tmp_path / "new", 2)
-    with pytest.raises(SystemExit, match="split text differently"):
+    with pytest.raises(SystemExit, match="settings differ .*for example"):
         interpolate(old, new, 0.5, tmp_path / "o")
     out = interpolate(old, new, 0.5, tmp_path / "o", allow_tokenizer_difference=True)
     assert json.loads((out / "tokenizer.json").read_text()) == TOKENIZER
+
+
+def test_tokenizer_setting_difference_without_probe_effect(tmp_path):
+    """A setting that changes no probe text (here the decoder) still needs --allow-tokenizer-difference."""
+    tokenizer = json.loads(json.dumps(TOKENIZER))
+    tokenizer["decoder"] = {"type": "ByteFallback"}
+    old, _ = make_ckpt(tmp_path / "old", 1, tokenizer=tokenizer)
+    new, _ = make_ckpt(tmp_path / "new", 2)
+    with pytest.raises(SystemExit, match=r"settings differ \(decoder\)"):
+        interpolate(old, new, 0.5, tmp_path / "o")
+
+
+def test_streamed_file_matches_save_file(tmp_path):
+    """save_streamed writes the bytes save_file writes: mixed dtypes, a scalar, an empty tensor, a non-ASCII name."""
+    from basal.interpolate import save_streamed
+
+    g = torch.Generator().manual_seed(0)
+    t = {"w": torch.randn(4, 8, generator=g).to(torch.bfloat16), "pos": torch.arange(5), "żółw": torch.randn(3),
+         "s": torch.tensor(2.5, dtype=torch.float16), "e": torch.zeros(0, 3), "m": torch.ones(2, dtype=torch.bool),
+         "f8": torch.randn(4, generator=g).to(torch.float8_e4m3fn)}
+    names = {torch.bfloat16: "BF16", torch.int64: "I64", torch.float32: "F32", torch.float16: "F16",
+             torch.bool: "BOOL", torch.float8_e4m3fn: "F8_E4M3"}
+    save_file(t, tmp_path / "ref.safetensors", metadata={"format": "pt"})
+    save_streamed(tmp_path / "got.safetensors", {k: (names[v.dtype], tuple(v.shape)) for k, v in t.items()},
+                  t.__getitem__, {"format": "pt"})
+    assert (tmp_path / "got.safetensors").read_bytes() == (tmp_path / "ref.safetensors").read_bytes()
 
 
 def test_meta_files_and_basal_json(pair, tmp_path):

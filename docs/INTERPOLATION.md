@@ -8,8 +8,9 @@
 α is the weight of the new checkpoint: α = 0 gives the old weights, α = 1 the new ones.
 - Each tensor is mixed in fp32 and stored in the new checkpoint's dtype.
 - Integer tensors are taken from the new checkpoint.
-- The output keeps the new checkpoint's shard layout and holds one output shard in memory at a time. Peak memory is
-  the largest shard plus one tensor in fp32.
+- The output keeps the new checkpoint's shard layout. It is streamed to disk one tensor at a time, with the bytes
+  `safetensors` `save_file` would write. Peak memory is the largest tensor in fp32, whatever the shard size: about
+  1.7 GB for the 4.5B models, against 30 GB when a whole shard is held in memory.
 - The merge is written to a temporary folder and renamed only when every shard is written, so a failure leaves no
   partial checkpoint. `--out` must not exist or must be empty.
 - The result is deterministic: the same inputs give byte-identical safetensors.
@@ -27,9 +28,11 @@ The tool refuses a pair before writing anything unless the two checkpoints have:
 
 Configs and tokenizers are compared by content, so a file written by an older transformers release passes.
 
-The tokenizers must also split text the same way, which the tool checks on probe texts. The `Bielik-*-v3.0-Instruct`
-base models have basal-2.0's vocabulary but an older tokenizer layout, which adds a word boundary after special tokens
-and at a leading space. They are accepted only with `--allow-tokenizer-difference`.
+The tokenizers must also have the same settings that decide how text is split: normalizer, pre-tokenizer,
+post-processor, decoder and model options. The `Bielik-*-v3.0-Instruct` base models have basal-2.0's vocabulary but an
+older tokenizer layout, which adds a word boundary after special tokens and at a leading space. They are accepted only
+with `--allow-tokenizer-difference`. When a refused pair splits one of the probe texts differently, the error message
+shows that text.
 
 The merged model is served with the `--meta-from` tokenizer only. With basal-2.0 on the new side, that is the tokenizer
 basal-2.0 was fine-tuned with.
