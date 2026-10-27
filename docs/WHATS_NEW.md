@@ -1,3 +1,12 @@
+# What is new in basal 2.4.2 (not released yet)
+
+- **A Python client for every question type** (`basal.client`): methods for `multi`, `act`, `tool`, `classify`,
+  `verify`, `compress` and `extract` next to `choice`, `yes_no` and `score`; `decide` with question builders for several
+  questions in one request; `AsyncBasal` for asyncio; the server's status codes as `InvalidRequest` (422),
+  `OutOfMemory` (503, retried with `retries=`) and `ServerError` (500), all still a `RuntimeError`; `models()`,
+  `health()` and your own httpx client (`http=`). Existing calls are unchanged.
+  [INSTALL.md](INSTALL.md#nvidia-gpu-the-basal-engine-recommended)
+
 # What is new in basal 2.4.1
 
 - **Shorter start-up of the graph engine** (`--mode fast`): every CUDA graph is warmed up once before its capture
