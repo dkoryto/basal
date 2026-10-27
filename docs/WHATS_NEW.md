@@ -1,3 +1,10 @@
+# What is new in basal 2.4.2 (not released yet)
+
+- **Fix: task questions next to a question named `<task>::<part>`**: such a name is one of the task's expanded
+  questions, so the task read that question's answer as its own (a `classify` named `task` answered with the label of a
+  `choice` named `task::labels`) and the other answer was dropped. In a request with task questions a name with `::`
+  is now refused (HTTP 422), as a task question's own name already was. Reported by Sourcery's review of #58.
+
 # What is new in basal 2.4.1
 
 - **Shorter start-up of the graph engine** (`--mode fast`): every CUDA graph is warmed up once before its capture
