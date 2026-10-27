@@ -79,8 +79,9 @@ def test_defaults_and_fields_of_decide():
                                         (404, ServerError)])
 def test_status_codes_are_exceptions(status, cls):
     _, handler = recording(statuses=[status])
-    with pytest.raises(cls, match=f"status {status}") as e:
+    with pytest.raises(cls) as e:
         client(handler).yes_no(STATE, "Late?")
+    assert str(e.value) == f"status {status}"  # the server's "error" text, not the JSON body
     assert e.value.status == status and isinstance(e.value, RuntimeError)  # the 2.4 client raised RuntimeError
 
 
@@ -100,8 +101,9 @@ def test_only_out_of_memory_is_retried():
 def test_a_body_that_is_not_json_is_a_server_error():
     b = Basal("http://basal", http=httpx.Client(transport=httpx.MockTransport(
         lambda r: httpx.Response(502, text="Bad Gateway"))))
-    with pytest.raises(ServerError, match="Bad Gateway"):
+    with pytest.raises(ServerError) as e:
         b.decide(STATE, {"q": C.yes_no("Late?")})
+    assert str(e.value) == "Bad Gateway" and e.value.status == 502
 
 
 def on_app(srv, fn, **kw):
@@ -154,10 +156,19 @@ def test_every_question_type_is_a_request_the_server_answers():
 def test_async_client_errors_through_the_server():
     async def invalid(b):
         return await b.choice(STATE, "Which?", {"a": "Alpha"})
-    with pytest.raises(InvalidRequest, match="1 options"):
+    with pytest.raises(InvalidRequest) as e:
         on_app(AppServer(Engine()), invalid)
+    assert "1 options" in str(e.value) and not str(e.value).startswith("{")
 
     async def oom(b):
         return await b.yes_no(STATE, "Late?")
-    with pytest.raises(OutOfMemory, match="out of memory"):
+    with pytest.raises(OutOfMemory) as e:
         on_app(AppServer(Engine(torch.OutOfMemoryError("CUDA out of memory"))), oom, retries=1, backoff=0)
+    assert str(e.value) == "CUDA out of memory" and e.value.status == 503
+
+
+@pytest.mark.parametrize("retries", [-1, 1.5, None])
+def test_retries_must_be_a_count(retries):
+    for cls in (Basal, AsyncBasal):
+        with pytest.raises(ValueError, match="retries"):
+            cls("http://basal", retries=retries)
