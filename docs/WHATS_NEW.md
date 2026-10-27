@@ -5,7 +5,7 @@
   questions in one request; `AsyncBasal` for asyncio; the server's status codes as `InvalidRequest` (422),
   `OutOfMemory` (503, retried with `retries=`) and `ServerError` (500), all still a `RuntimeError`; `models()`,
   `health()` and your own httpx client (`http=`). Existing calls are unchanged.
-  [INSTALL.md](INSTALL.md#nvidia-gpu-the-basal-engine-recommended)
+  [#58](https://github.com/rkinas/basal/pull/58), [INSTALL.md](INSTALL.md#nvidia-gpu-the-basal-engine-recommended)
 
 # What is new in basal 2.4.1
 
